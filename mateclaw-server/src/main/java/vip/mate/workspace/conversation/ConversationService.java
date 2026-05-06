@@ -1,16 +1,25 @@
 package vip.mate.workspace.conversation;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.approval.ApprovalPlaceholderUtil;
 import vip.mate.approval.MetadataDecision;
 import vip.mate.agent.repository.AgentMapper;
+import vip.mate.approval.model.ToolApprovalEntity;
+import vip.mate.approval.repository.ToolApprovalMapper;
+import vip.mate.channel.model.ChannelSessionEntity;
+import vip.mate.channel.repository.ChannelSessionMapper;
+import vip.mate.task.model.AsyncTaskEntity;
+import vip.mate.task.repository.AsyncTaskMapper;
 import vip.mate.workspace.conversation.model.ConversationEntity;
 import vip.mate.workspace.conversation.model.MessageContentPart;
 import vip.mate.workspace.conversation.model.MessageEntity;
@@ -49,6 +58,9 @@ public class ConversationService {
     private final MessageMapper messageMapper;
     private final AgentMapper agentMapper;
     private final ObjectMapper objectMapper;
+    private final ToolApprovalMapper toolApprovalMapper;
+    private final AsyncTaskMapper asyncTaskMapper;
+    private final ChannelSessionMapper channelSessionMapper;
 
     /**
      * 获取用户的会话列表（返回 VO，包含 agentName/agentIcon/status）
@@ -421,15 +433,68 @@ public class ConversationService {
     }
 
     /**
-     * 删除会话（同时删除消息和附件文件）
+     * Delete a conversation and cascade-clean every row that referenced it.
+     * <p>
+     * Tables cleaned in the same transaction:
+     * <ul>
+     *   <li>{@code mate_message} — chat history</li>
+     *   <li>{@code mate_tool_approval} — pending approvals would otherwise
+     *       point to a non-existent conversation and surface as ghost items
+     *       in the approvals list</li>
+     *   <li>{@code mate_async_task} — long-running task records keyed on
+     *       this conversation</li>
+     *   <li>{@code mate_channel_session} — channel-side session row (the
+     *       column is UNIQUE; leaving it would block reuse of the same id)</li>
+     *   <li>{@code mate_conversation} — the conversation itself</li>
+     * </ul>
+     * Child conversations (delegated turns) have their
+     * {@code parent_conversation_id} set to NULL rather than cascade-deleted,
+     * so the user keeps independent access to delegated work.
+     * <p>
+     * Audit / history tables ({@code mate_tool_guard_audit_log},
+     * {@code mate_cron_job_run}, {@code mate_skill.source_conversation_id},
+     * {@code mate_skill_usage_stat}) are intentionally left alone — those
+     * are append-only records that should outlive their source conversation.
+     * <p>
+     * Attachment file cleanup is registered as an after-commit hook so it
+     * runs only when the DB cascade actually persists, and an IO failure
+     * cannot roll back the database deletes.
      */
     @Transactional
     public void deleteConversation(String conversationId) {
-        conversationMapper.delete(new LambdaQueryWrapper<ConversationEntity>()
-                .eq(ConversationEntity::getConversationId, conversationId));
-        messageMapper.delete(new LambdaQueryWrapper<MessageEntity>()
+        int messages = messageMapper.delete(new LambdaQueryWrapper<MessageEntity>()
                 .eq(MessageEntity::getConversationId, conversationId));
-        cleanAttachmentFiles(conversationId);
+        int approvals = toolApprovalMapper.delete(new LambdaQueryWrapper<ToolApprovalEntity>()
+                .eq(ToolApprovalEntity::getConversationId, conversationId));
+        int asyncTasks = asyncTaskMapper.delete(new LambdaQueryWrapper<AsyncTaskEntity>()
+                .eq(AsyncTaskEntity::getConversationId, conversationId));
+        int channelSessions = channelSessionMapper.delete(new LambdaQueryWrapper<ChannelSessionEntity>()
+                .eq(ChannelSessionEntity::getConversationId, conversationId));
+        int childrenUnlinked = conversationMapper.update(null, new LambdaUpdateWrapper<ConversationEntity>()
+                .set(ConversationEntity::getParentConversationId, null)
+                .eq(ConversationEntity::getParentConversationId, conversationId));
+        int conversations = conversationMapper.delete(new LambdaQueryWrapper<ConversationEntity>()
+                .eq(ConversationEntity::getConversationId, conversationId));
+
+        log.info("[Conversation] Deleted {}: messages={}, approvals={}, asyncTasks={},"
+                        + " channelSessions={}, childrenUnlinked={}, conversationRow={}",
+                conversationId, messages, approvals, asyncTasks,
+                channelSessions, childrenUnlinked, conversations);
+
+        registerAttachmentCleanupAfterCommit(conversationId);
+    }
+
+    private void registerAttachmentCleanupAfterCommit(String conversationId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    cleanAttachmentFiles(conversationId);
+                }
+            });
+        } else {
+            cleanAttachmentFiles(conversationId);
+        }
     }
 
     /**
