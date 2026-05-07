@@ -255,7 +255,28 @@ public class SkillController {
     @Operation(summary = "获取已启用技能列表")
     @GetMapping("/enabled")
     public R<List<SkillEntity>> listEnabled() {
-        return R.ok(skillService.listEnabledSkills());
+        // Mirror the merging the paginated /skills endpoint does so the agent
+        // edit picker (which calls this endpoint) sees MCP- and ACP-derived
+        // virtual skills alongside the persisted ones. The shadow base must
+        // include all real skill names — including disabled ones — so a
+        // disabled real skill correctly suppresses its same-named virtual
+        // twin, matching /skills and /counts.
+        List<SkillEntity> result = new ArrayList<>(skillService.listEnabledSkills());
+        Set<String> realNames = realSkillNames();
+
+        try {
+            result.addAll(filterShadowedVirtualSkills(
+                    mcpSkillBridge.listMcpDerivedSkillEntities(), realNames));
+        } catch (Exception e) {
+            // Bridge failure must not 500 the picker — same defensive stance as /counts.
+        }
+        try {
+            result.addAll(filterShadowedVirtualSkills(
+                    acpSkillBridge.listAcpDerivedSkillEntities(), realNames));
+        } catch (Exception e) {
+            // Bridge failure must not 500 the picker — same defensive stance as /counts.
+        }
+        return R.ok(result);
     }
 
     @Operation(summary = "按类型获取技能列表")
