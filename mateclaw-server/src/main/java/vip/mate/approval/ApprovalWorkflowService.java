@@ -8,8 +8,10 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
@@ -18,6 +20,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import vip.mate.agent.context.ChatOrigin;
 import vip.mate.agent.context.ChatOriginHolder;
+import vip.mate.approval.event.WorkflowApprovalResolvedEvent;
 import vip.mate.approval.model.ToolApprovalEntity;
 import vip.mate.approval.repository.ToolApprovalMapper;
 import vip.mate.tool.guard.model.GuardEvaluation;
@@ -52,6 +55,12 @@ public class ApprovalWorkflowService implements ApplicationRunner {
     private final ToolApprovalMapper approvalMapper;
     private final ObjectMapper objectMapper;
     private final ConversationService conversationService;
+    /** Optional — injected only in full Spring context. The workflow
+     *  module listens for {@link WorkflowApprovalResolvedEvent}; in tests
+     *  that don't wire the workflow runtime this stays null and the
+     *  publish is a no-op. */
+    @Autowired(required = false)
+    private ApplicationEventPublisher events;
 
     /**
      * GC scheduler — owns the 5-minute clock for the entire approval state machine
@@ -577,6 +586,42 @@ public class ApprovalWorkflowService implements ApplicationRunner {
             if (userId != null) snapshot.setResolvedBy(userId);
             if (removeFromMap) approvalService.removeFromMap(snapshot.getPendingId());
         });
+
+        // Phase 4 — workflow bridge. Workflow-scoped approval rows
+        // (pendingId starting with "wf-") are linked to a paused workflow
+        // run via {@code mate_workflow_run_pause.external_approval_id}.
+        // Publishing the resolve here lets the workflow module's listener
+        // call WorkflowResumer with the matching outcome, so an operator
+        // approving in the inbox actually advances the workflow instead
+        // of leaving it paused forever. We publish AFTER commit so a tx
+        // rollback can't fire a stale resume; the row id is stable
+        // because the row already lived in DB.
+        if (events != null && snapshot.getPendingId() != null
+                && snapshot.getPendingId().startsWith("wf-")) {
+            // Look up the row id since the snapshot only carries the string
+            // pendingId, not the long primary key. One quick equality query.
+            try {
+                ToolApprovalEntity row = approvalMapper.selectOne(
+                        new LambdaQueryWrapper<ToolApprovalEntity>()
+                                .eq(ToolApprovalEntity::getPendingId, snapshot.getPendingId()));
+                if (row != null && row.getId() != null) {
+                    final long rowId = row.getId();
+                    final String pendingId = snapshot.getPendingId();
+                    afterCommit(() -> {
+                        try {
+                            events.publishEvent(new WorkflowApprovalResolvedEvent(
+                                    rowId, pendingId, snapshotStatus, /* workspaceId */ null));
+                        } catch (Exception e) {
+                            log.warn("[ApprovalWorkflow] failed to publish workflow-resolved event for {}: {}",
+                                    pendingId, e.getMessage());
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                log.warn("[ApprovalWorkflow] approval row lookup for resolve event failed for {}: {}",
+                        snapshot.getPendingId(), e.getMessage());
+            }
+        }
 
         boolean consumed = "consumed".equals(snapshotStatus);
         ResolveOutcome outcome = consumed

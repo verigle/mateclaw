@@ -56,10 +56,15 @@ public class TriggerDispatcher {
             return DispatchResult.skipped(
                     "unsupported target_type: " + trigger.getTargetType());
         }
-        WorkflowGraphLoader.Loaded loaded = graphLoader.load(trigger.getTargetId());
+        // Workspace-scoped lookup so a workspace A trigger can never fire
+        // a workspace B workflow even if fixture data / manual imports /
+        // a service-bypass path somehow planted a cross-workspace
+        // targetId. The loader returns missing() on mismatch.
+        long workspaceId = trigger.getWorkspaceId() == null ? 0L : trigger.getWorkspaceId();
+        WorkflowGraphLoader.Loaded loaded = graphLoader.load(trigger.getTargetId(), workspaceId);
         if (loaded.graph() == null) {
-            log.info("Trigger {} dispatch skipped: no published revision for workflow {}",
-                    trigger.getId(), trigger.getTargetId());
+            log.info("Trigger {} dispatch skipped: no published revision for workflow {} in workspace {}",
+                    trigger.getId(), trigger.getTargetId(), workspaceId);
             return DispatchResult.skipped(
                     "no published revision for workflow " + trigger.getTargetId());
         }
@@ -98,22 +103,39 @@ public class TriggerDispatcher {
         }
     }
 
+    /**
+     * Render the trigger's payload template into the workflow's input map.
+     *
+     * <p><b>Failure mode is strict.</b> If the template fails to parse,
+     * fails to render, or produces output that isn't a JSON object, this
+     * method throws and {@link #dispatch} returns
+     * {@link DispatchResult#failed(String)} so the trigger row records a
+     * non-null {@code last_error} and the operator can see why this fire
+     * didn't run. The previous "fall back to raw event" behaviour is the
+     * exact silent-failure trap the design forbade — a typo'd template
+     * would keep firing the workflow with the wrong inputs and lastError
+     * would stay clean.
+     *
+     * <p>An empty / null {@code payloadTemplate} is the explicit
+     * opt-in to "use the raw event as inputs" — that path stays
+     * supported because it's intentional, not accidental.
+     */
     private Map<String, Object> renderInputs(TriggerEntity trigger, Map<String, Object> event) {
         if (trigger.getPayloadTemplate() == null || trigger.getPayloadTemplate().isBlank()) {
             return event == null ? Map.of() : event;
         }
+        var compiled = pebble.parseTemplate(trigger.getPayloadTemplate());
+        String rendered = pebble.evaluateAsString(compiled,
+                Map.of("event", event == null ? Map.of() : event,
+                        "trigger", Map.of(
+                                "id", trigger.getId(),
+                                "name", trigger.getName() == null ? "" : trigger.getName())));
         try {
-            var compiled = pebble.parseTemplate(trigger.getPayloadTemplate());
-            String rendered = pebble.evaluateAsString(compiled,
-                    Map.of("event", event == null ? Map.of() : event,
-                            "trigger", Map.of(
-                                    "id", trigger.getId(),
-                                    "name", trigger.getName() == null ? "" : trigger.getName())));
             return objectMapper.readValue(rendered, MAP_REF);
         } catch (Exception e) {
-            log.warn("Trigger {} payload template render failed; falling back to raw event: {}",
-                    trigger.getId(), e.getMessage());
-            return event == null ? Map.of() : event;
+            // Wrap so the dispatcher's catch surfaces the JSON parse failure
+            // distinctly from a Pebble parse / evaluate failure.
+            throw new RuntimeException("payloadTemplate produced non-JSON output: " + e.getMessage(), e);
         }
     }
 }

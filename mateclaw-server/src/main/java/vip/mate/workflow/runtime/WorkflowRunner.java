@@ -171,17 +171,37 @@ public class WorkflowRunner {
     private GroupOutcome executeFanOutGroup(List<WorkflowStep> steps, int from, int collectIdx,
                                             WorkflowRunContext ctx) {
         // Steps from..collectIdx-1 are fan_out branches; collectIdx is the join.
-        record Branch(int stepIndex, WorkflowStep step, Future<StepResult> future) {}
+        //
+        // RFC §2.4 requires every branch to render expressions / prompts
+        // against the SAME context snapshot taken at group entry, with
+        // collect doing the merge. To honour that we hand each branch its
+        // own isolated WorkflowRunContext via branchSnapshot() — writes
+        // inside a branch (via ctx.putOutput from executeStep) land in
+        // that local copy and stay invisible to siblings until merge
+        // time. Without this, a branch racing ahead would mutate the
+        // shared outputs map and the slower branch's Pebble template
+        // would observe a mid-flight value, making rendering
+        // schedule-dependent.
+        record Branch(int stepIndex, WorkflowStep step,
+                      WorkflowRunContext branchCtx, Future<StepResult> future) {}
         List<Branch> branches = new ArrayList<>();
         for (int i = from; i < collectIdx; i++) {
             int idx = i;
             WorkflowStep step = steps.get(i);
+            WorkflowRunContext branchCtx = ctx.branchSnapshot();
             Future<StepResult> future = FAN_OUT_EXECUTOR.submit(
-                    () -> executeStep(step, idx, idx - from, ctx));
-            branches.add(new Branch(idx, step, future));
+                    () -> executeStep(step, idx, idx - from, branchCtx));
+            branches.add(new Branch(idx, step, branchCtx, future));
         }
 
-        String lastOutputRef = null;
+        // Collect succeeded branch results in step-index order. The
+        // result list lets us merge outputs into the master context
+        // deterministically below — a branch's outputVar always wins
+        // over a smaller-index branch's outputVar with the same name,
+        // so the conflict policy is "later step wins" and is independent
+        // of completion order.
+        record Settled(int stepIndex, WorkflowStep step, StepResult result) {}
+        List<Settled> settled = new ArrayList<>(branches.size());
         for (Branch branch : branches) {
             try {
                 StepResult result = branch.future.get(resolveTimeoutSecs(branch.step), TimeUnit.SECONDS);
@@ -190,12 +210,26 @@ public class WorkflowRunner {
                             "fan_out branch '" + branch.step.name() + "' failed: " + result.errorMessage(),
                             null);
                 }
-                if (result.outputPayloadUri() != null) lastOutputRef = result.outputPayloadUri();
+                settled.add(new Settled(branch.stepIndex, branch.step, result));
             } catch (Exception e) {
                 return new GroupOutcome(true,
                         "fan_out branch '" + branch.step.name() + "' threw: " + e.getMessage(),
                         null);
             }
+        }
+
+        // Merge phase — the master context only learns about a branch's
+        // outputVar value here, so collect (and any subsequent step)
+        // sees a stable, schedule-independent view.
+        String lastOutputRef = null;
+        settled.sort((a, b) -> Integer.compare(a.stepIndex, b.stepIndex));
+        for (Settled s : settled) {
+            if (s.result.state() != StepResult.State.SUCCEEDED) continue;
+            if (s.step.outputVar() != null && !s.step.outputVar().isBlank()
+                    && s.result.outputValue() != null) {
+                ctx.mergeOutput(s.step.outputVar(), s.result.outputValue());
+            }
+            if (s.result.outputPayloadUri() != null) lastOutputRef = s.result.outputPayloadUri();
         }
 
         // Run the collect adapter so the join is captured as its own row.

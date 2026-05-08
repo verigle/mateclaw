@@ -61,4 +61,41 @@ public class WorkflowRunContext {
         ctx.put("outputs", new LinkedHashMap<>(outputs));
         return ctx;
     }
+
+    /**
+     * Build a child context for one fan_out branch. The child shares
+     * {@code inputs} with the parent (immutable already) and gets a
+     * deep-copied snapshot of the parent's outputs at branch-entry time
+     * — writes via the child's {@link #putOutput} do NOT propagate back
+     * to this context until the runner explicitly merges them after the
+     * group completes. That snapshot isolation is what stops branch B's
+     * Pebble template from observing branch A's mid-flight write
+     * (or vice-versa) when they race on the executor.
+     *
+     * <p>The merge step is owned by the runner — see
+     * {@code WorkflowRunner.executeFanOutGroup}. The branch's own
+     * {@code outputVar} write IS still visible inside the branch, which
+     * is what the schema validator promises authors: a branch can see
+     * its own value but never its sibling branches'.
+     */
+    public synchronized WorkflowRunContext branchSnapshot() {
+        WorkflowRunContext child = new WorkflowRunContext(runId, workspaceId,
+                workflowId, revisionId, inputs);
+        // Seed the child with a snapshot of the parent's outputs so the
+        // branch can read everything that completed before the fan_out
+        // group started, but its own writes stay local.
+        child.outputs.putAll(this.outputs);
+        return child;
+    }
+
+    /**
+     * Merge a single key/value into the outputs map. Used by the runner
+     * after a fan_out group completes to apply each branch's
+     * {@code outputVar} to the master context in deterministic
+     * step-index order.
+     */
+    public synchronized void mergeOutput(String name, Object value) {
+        if (name == null || name.isBlank()) return;
+        outputs.put(name, value);
+    }
 }

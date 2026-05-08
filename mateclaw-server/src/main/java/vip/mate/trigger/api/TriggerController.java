@@ -79,16 +79,27 @@ public class TriggerController {
 
     /**
      * Ingest one event envelope through the dedup / rate-limit / bot-self
-     * pipeline. The endpoint is open to operators; production deployments
-     * SHOULD gate it behind the workspace interceptor / a service token
-     * before exposing it externally.
+     * pipeline. The endpoint is the operator-facing surface — workspace
+     * is taken from the trusted {@code X-Workspace-Id} header. Body
+     * {@code workspaceId} is intentionally ignored so a caller in
+     * workspace A can't fan-fire triggers in workspace B by hand-rolling
+     * a JSON body.
+     *
+     * <p>External webhooks should NOT use this endpoint directly —
+     * production deployments wire their own signed-token webhook
+     * (e.g. Feishu / DingTalk adapters) which authenticates first and
+     * publishes a {@link vip.mate.channel.event.ChannelMessageReceivedEvent}
+     * with a workspace fixed by the channel-token mapping. The
+     * {@code ChannelMessageEventBridge} then forwards into ingest.
      */
     @Operation(summary = "Ingest one event envelope; returns per-trigger fire / drop summary.")
     @PostMapping("/events")
     public R<List<TriggerEventIngestService.IngestResult>> ingestEvent(
-            @RequestBody EventIngestRequest body) {
+            @RequestBody EventIngestRequest body,
+            @RequestHeader("X-Workspace-Id") long workspaceId) {
         TriggerEventEnvelope env = new TriggerEventEnvelope(
-                body.workspaceId(),
+                // Header wins — body.workspaceId is dropped on purpose.
+                workspaceId,
                 body.patternType(),
                 body.eventId(),
                 body.senderId(),
@@ -96,6 +107,9 @@ public class TriggerController {
         return R.ok(ingestService.ingest(env));
     }
 
+    /** {@code workspaceId} is retained on the request shape for backwards
+     *  compatibility but ignored at the controller — the trusted header
+     *  is the source of truth. */
     public record EventIngestRequest(
             long workspaceId,
             String patternType,

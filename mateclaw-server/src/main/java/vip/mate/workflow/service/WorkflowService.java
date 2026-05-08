@@ -155,6 +155,17 @@ public class WorkflowService {
         revisionMapper.insert(revision);
 
         workflow.setLatestRevisionId(revision.getId());
+        // RFC v0 contract: publishing clears the inline draft on the
+        // workflow row. The published revision is now the canonical
+        // graph; keeping the draft would let the UI show "draft + v3"
+        // when in fact the draft has just become v3, which confuses
+        // operators ("did my changes go in?"). Authors who want a
+        // continuing-edit flow can re-save a fresh draft after publish;
+        // it'll show up as "draft modified after publish" naturally.
+        workflow.setDraftJson(null);
+        workflow.setDraftSchemaVersion(null);
+        workflow.setDraftUpdatedBy(null);
+        workflow.setDraftUpdatedAt(null);
         workflowMapper.updateById(workflow);
         return new PublishOutcome(workflow, revision);
     }

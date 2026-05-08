@@ -33,10 +33,19 @@ public class DefaultWorkflowGraphLoader implements WorkflowGraphLoader {
     }
 
     @Override
-    public Loaded load(long workflowId) {
+    public Loaded load(long workflowId, long workspaceId) {
         WorkflowEntity workflow = workflowMapper.selectById(workflowId);
         if (workflow == null || Boolean.FALSE.equals(workflow.getEnabled())
                 || workflow.getLatestRevisionId() == null) {
+            return Loaded.missing();
+        }
+        // Workspace ownership check — the trigger must live in the same
+        // workspace as the workflow. Without this gate, fixture data /
+        // manual imports / a service-bypass code path could let a
+        // workspace A trigger fire a workspace B workflow.
+        if (workflow.getWorkspaceId() == null || workflow.getWorkspaceId() != workspaceId) {
+            log.warn("Trigger graph load: workflow {} is in workspace {}, caller asked for {}",
+                    workflowId, workflow.getWorkspaceId(), workspaceId);
             return Loaded.missing();
         }
         WorkflowRevisionEntity revision = revisionMapper.selectById(workflow.getLatestRevisionId());
@@ -48,5 +57,21 @@ public class DefaultWorkflowGraphLoader implements WorkflowGraphLoader {
                     revision.getId(), e.getMessage());
             return Loaded.missing();
         }
+    }
+
+    /**
+     * @deprecated production callers MUST use the workspace-scoped overload
+     *             {@link #load(long, long)}. Kept available for legacy test
+     *             stubs that bind a fake workspace context. Returns
+     *             {@code missing()} unconditionally so a production code
+     *             path that accidentally hits this overload doesn't silently
+     *             cross workspaces.
+     */
+    @Override
+    @Deprecated
+    public Loaded load(long workflowId) {
+        log.warn("Workspace-blind WorkflowGraphLoader.load({}) called — refusing. " +
+                "Use load(workflowId, workspaceId) instead.", workflowId);
+        return Loaded.missing();
     }
 }
