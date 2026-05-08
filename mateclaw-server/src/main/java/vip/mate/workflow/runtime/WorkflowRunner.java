@@ -40,6 +40,7 @@ public class WorkflowRunner {
     private static final String STATE_SUCCEEDED = "succeeded";
     private static final String STATE_FAILED = "failed";
     private static final String STATE_SKIPPED = "skipped";
+    private static final String STATE_PAUSED = "paused";
 
     private static final ExecutorService FAN_OUT_EXECUTOR =
             Executors.newVirtualThreadPerTaskExecutor();
@@ -61,21 +62,43 @@ public class WorkflowRunner {
 
     public WorkflowRunResult run(WorkflowGraph graph, WorkflowRunRequest request) {
         WorkflowRunEntity runRow = openRun(request);
-        long runId = runRow.getId();
         String inputsRef = payloadStore.storeJson(request.workspaceId(), request.inputs());
         runRow.setInitialInputRef(inputsRef);
         runMapper.updateById(runRow);
 
         WorkflowRunContext ctx = new WorkflowRunContext(
-                runId,
+                runRow.getId(),
                 request.workspaceId(),
                 request.workflowId(),
                 request.revisionId(),
                 request.inputs());
 
-        String lastSucceededOutputRef = null;
+        return executeFromIndex(graph, ctx, runRow, /*fromIndex*/ 0, /*priorOutputRef*/ null);
+    }
+
+    /**
+     * Continue an already-open run from {@code fromIndex}. Used by the resumer
+     * after a pause settles. {@code priorOutputRef} is the last successful
+     * step's output URI from before the pause — propagated so the
+     * {@code final_output_ref} on success still points at meaningful data when
+     * the post-resume tail of the run produces no further output.
+     */
+    public WorkflowRunResult continueFromIndex(WorkflowGraph graph, WorkflowRunContext ctx,
+                                               WorkflowRunEntity runRow, int fromIndex,
+                                               String priorOutputRef) {
+        // Move the run row back to running so step-completion timestamps make
+        // sense and the GC sweeper does not see a stale paused row.
+        runRow.setState(STATE_RUNNING);
+        runMapper.updateById(runRow);
+        return executeFromIndex(graph, ctx, runRow, fromIndex, priorOutputRef);
+    }
+
+    private WorkflowRunResult executeFromIndex(WorkflowGraph graph, WorkflowRunContext ctx,
+                                               WorkflowRunEntity runRow, int fromIndex,
+                                               String priorOutputRef) {
+        String lastSucceededOutputRef = priorOutputRef;
         try {
-            int i = 0;
+            int i = fromIndex;
             while (i < graph.steps().size()) {
                 WorkflowStep step = graph.steps().get(i);
                 int groupEnd = scanFanOutGroup(graph.steps(), i);
@@ -91,6 +114,9 @@ public class WorkflowRunner {
                     if (result.state() == StepResult.State.FAILED) {
                         return finishFailed(runRow, result.errorMessage());
                     }
+                    if (result.state() == StepResult.State.PAUSED) {
+                        return finishPaused(runRow, result.pauseToken());
+                    }
                     if (result.outputPayloadUri() != null) {
                         lastSucceededOutputRef = result.outputPayloadUri();
                     }
@@ -99,7 +125,7 @@ public class WorkflowRunner {
             }
             return finishSucceeded(runRow, lastSucceededOutputRef);
         } catch (RuntimeException e) {
-            log.error("Workflow run {} aborted by unexpected exception", runId, e);
+            log.error("Workflow run {} aborted by unexpected exception", ctx.runId(), e);
             return finishFailed(runRow, "runtime error: " + e.getMessage());
         }
     }
@@ -226,6 +252,13 @@ public class WorkflowRunner {
         return new WorkflowRunResult(runRow.getId(), STATE_FAILED, null, errorMessage);
     }
 
+    private WorkflowRunResult finishPaused(WorkflowRunEntity runRow, String pauseToken) {
+        runRow.setState(STATE_PAUSED);
+        // Pause leaves the run open — completedAt stays null until resume settles it.
+        runMapper.updateById(runRow);
+        return new WorkflowRunResult(runRow.getId(), STATE_PAUSED, null, "pauseToken=" + pauseToken);
+    }
+
     private WorkflowRunStepEntity openStep(long runId, int stepIndex, Integer iterationIndex,
                                            WorkflowStep step) {
         WorkflowRunStepEntity row = new WorkflowRunStepEntity();
@@ -246,6 +279,7 @@ public class WorkflowRunner {
             case SUCCEEDED -> row.setState(STATE_SUCCEEDED);
             case SKIPPED   -> row.setState(STATE_SKIPPED);
             case FAILED    -> row.setState(STATE_FAILED);
+            case PAUSED    -> row.setState(STATE_PAUSED);
         }
         row.setOutputRef(result.outputPayloadUri());
         if (result.outputContentType() != null) {
