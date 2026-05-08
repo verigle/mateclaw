@@ -79,9 +79,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, markRaw, onBeforeUnmount, provide, ref, watch } from 'vue'
+import { computed, markRaw, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { VueFlow, type Node } from '@vue-flow/core'
+import { VueFlow, useVueFlow, type Node } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
@@ -139,19 +139,31 @@ const miniNodeColor = (node: Node<StepNodeData>) => {
 }
 const miniNodeStrokeColor = () => 'transparent'
 
-// Vue-flow's `@node-click` event signature has shifted across minor
-// versions and sometimes doesn't fire reliably for custom-node templates
-// because the click can be swallowed by the inner DOM. Bypass it: we
-// provide a selection callback to the StepNode via inject, and the node
-// invokes it directly on its own click handler.
+// Three independent paths for getting a node click out of vue-flow into
+// the parent's inspector — at least one always works regardless of how
+// the click lands inside vue-flow's internal DOM.
+//
+//  1. `useVueFlow().onNodeClick` — the official subscription API tied
+//     to the flow instance keyed by props.canvasId.
+//  2. `provide('selectStepCallback', ...)` — the StepNode injects this
+//     and fires it on its own @click. Survives vue-flow re-renders.
+//  3. The template `@node-click` attribute below — kept as a third
+//     fallback for completeness.
 function selectStep(data: StepNodeData | null) {
   emit('select-step', data)
 }
 provide('selectStepCallback', selectStep)
 
+const flow = useVueFlow(props.canvasId)
+onMounted(() => {
+  flow.onNodeClick((evt) => {
+    const data = (evt?.node as Node<StepNodeData> | undefined)?.data
+    if (data) selectStep(data)
+  })
+  flow.onPaneClick(() => selectStep(null))
+})
+
 function handleNodeClick(payload: { node: Node<StepNodeData> } | unknown) {
-  // Backup path: if vue-flow does fire its own node-click event with the
-  // expected shape, route it through the same emit.
   const node = (payload as { node?: Node<StepNodeData> })?.node
   if (node?.data) selectStep(node.data)
 }
