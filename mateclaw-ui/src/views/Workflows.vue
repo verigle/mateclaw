@@ -65,11 +65,13 @@
                 v-model="canvasModel"
                 :canvas-id="`wf-${selected.id}`"
                 @select-step="onCanvasSelect"
+                @insert-step="onInsertStep"
               >
                 <template v-if="canvasSelection" #panel>
                   <StepPropertyPanel
                     :step="selectedStep"
                     :index="canvasSelection.index"
+                    :available-agents="availableAgents"
                     @patch="onStepPatch"
                     @duplicate="onStepDuplicate"
                     @delete="onStepDelete"
@@ -212,6 +214,7 @@ import { useI18n } from 'vue-i18n'
 import { mcConfirm } from '@/components/common/useConfirm'
 import { ElMessage } from 'element-plus'
 import {
+  agentApi,
   workflowApi,
   type WorkflowSummary,
   type WorkflowRun,
@@ -251,6 +254,12 @@ const runs = ref<WorkflowRun[]>([])
 const runDetail = ref<{ run: WorkflowRun; steps: WorkflowRunStep[] } | null>(null)
 const pausedRuns = ref<PausedRunSummary[]>([])
 const resumingId = ref<number | null>(null)
+
+// Workspace agent list — fed to the StepPropertyPanel's agent picker
+// so authors stop typing free-form agent names that don't actually
+// exist. Loaded once on mount and on workspace switch.
+interface AgentOption { id: number; name: string; title?: string }
+const availableAgents = ref<AgentOption[]>([])
 
 const templateChoice = ref('')
 
@@ -377,11 +386,42 @@ const STEP_TEMPLATES: Record<string, object> = {
 function insertTemplate() {
   const choice = templateChoice.value
   if (!choice) return
+  appendStepTemplate(choice)
+  templateChoice.value = ''
+}
+
+/**
+ * Insert a step from the canvas toolbar's "+ add node" picker. When a
+ * canvas node is selected we splice the new step in right after it; on
+ * an empty selection we append at the end. The same STEP_TEMPLATES
+ * skeletons the JSON-tab dropdown uses keep the two entry points
+ * consistent.
+ */
+function onInsertStep(payload: { afterIndex: number; modeType: string }) {
+  const stepBlock = STEP_TEMPLATES[payload.modeType]
+  if (!stepBlock) return
+  // The canvas hands us afterIndex=-1 because it doesn't know about
+  // canvasSelection on this side. Resolve "after the currently selected
+  // step" here so the toolbar UX feels consistent with the inspector.
+  const selIndex = canvasSelection.value?.index ?? -1
+  let next: string
+  try {
+    const parsed = JSON.parse(draftJson.value || '{}') as { steps?: unknown[] }
+    if (!Array.isArray(parsed.steps)) parsed.steps = []
+    const insertAt = selIndex >= 0 && selIndex < parsed.steps.length
+        ? selIndex + 1
+        : parsed.steps.length
+    parsed.steps.splice(insertAt, 0, stepBlock)
+    next = JSON.stringify(parsed, null, 2)
+  } catch {
+    next = JSON.stringify({ steps: [stepBlock] }, null, 2)
+  }
+  draftJson.value = next
+}
+
+function appendStepTemplate(choice: string) {
   const stepBlock = STEP_TEMPLATES[choice]
   if (!stepBlock) return
-  // Try to inject into an existing draft's `steps` array; fall back to a
-  // fresh skeleton if the current text isn't valid JSON or doesn't have
-  // the expected shape.
   let next: string
   try {
     const parsed = JSON.parse(draftJson.value || '{}') as { steps?: unknown[] }
@@ -392,7 +432,6 @@ function insertTemplate() {
     next = JSON.stringify({ steps: [stepBlock] }, null, 2)
   }
   draftJson.value = next
-  templateChoice.value = ''
 }
 
 async function reload() {
@@ -440,6 +479,20 @@ async function reloadPausedRuns() {
     pausedRuns.value = (res.data as unknown as PausedRunSummary[]) ?? []
   } catch (e) {
     console.error('listPausedRuns failed', e)
+  }
+}
+
+async function reloadAgents() {
+  try {
+    const res = await agentApi.list()
+    const rows = (res.data as unknown as AgentOption[]) ?? []
+    // The agent list endpoint already scopes to the caller's workspace
+    // via the X-Workspace-Id header, so no client-side filter is needed.
+    availableAgents.value = rows
+        .filter((a) => a && a.name)
+        .map((a) => ({ id: a.id, name: a.name, title: a.title }))
+  } catch (e) {
+    console.error('listAgents failed', e)
   }
 }
 
@@ -641,10 +694,12 @@ function formatTime(iso?: string) {
 onMounted(async () => {
   await reload()
   await reloadPausedRuns()
+  await reloadAgents()
 })
 watch(workspaceId, async () => {
   await reload()
   await reloadPausedRuns()
+  await reloadAgents()
 })
 </script>
 

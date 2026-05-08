@@ -39,13 +39,42 @@
 
       <label class="panel-field" v-if="modeNeedsAgent">
         <span class="field-label">{{ t('workflows.canvas.nodeAgent') }}</span>
-        <input
-          class="mc-input"
-          :value="step.agentName ?? ''"
-          @input="patch({ agentName: ($event.target as HTMLInputElement).value })"
-          spellcheck="false"
-          :placeholder="t('workflows.canvas.fields.agentPlaceholder')"
-        />
+        <!-- Agent picker — drops down the workspace's agents and falls
+             back to a free-text input when the operator wants to type a
+             name that isn't in the list (legacy drafts, agent created in
+             a different workspace by an admin, etc.). -->
+        <div class="agent-picker">
+          <select
+            v-if="!useFreeAgentName"
+            class="mc-input"
+            :value="agentSelectValue"
+            @change="onAgentSelect"
+          >
+            <option value="">{{ t('workflows.canvas.fields.agentPlaceholder') }}</option>
+            <option v-for="a in availableAgents" :key="a.id" :value="a.name">
+              {{ a.name }}<template v-if="a.title"> — {{ a.title }}</template>
+            </option>
+            <option v-if="agentNotInList" :value="step.agentName ?? ''" disabled>
+              {{ t('workflows.canvas.fields.agentMissing', { name: step.agentName }) }}
+            </option>
+            <option value="__custom__">{{ t('workflows.canvas.fields.agentUseCustom') }}</option>
+          </select>
+          <input
+            v-else
+            class="mc-input"
+            :value="step.agentName ?? ''"
+            @input="patch({ agentName: ($event.target as HTMLInputElement).value })"
+            spellcheck="false"
+            :placeholder="t('workflows.canvas.fields.agentPlaceholder')"
+          />
+          <button
+            v-if="useFreeAgentName"
+            type="button"
+            class="agent-toggle"
+            :title="t('workflows.canvas.fields.agentBackToList')"
+            @click="useFreeAgentName = false"
+          >×</button>
+        </div>
       </label>
 
       <label class="panel-field" v-if="modeNeedsAgent">
@@ -242,18 +271,31 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { RawStep } from '@/composables/useWorkflowGraph'
+
+/** Minimal agent shape the panel needs to render the picker — kept
+ *  inside the component so the panel doesn't have to import the
+ *  full workspace agent type. */
+export interface AgentOption {
+  id: number | string
+  name: string
+  title?: string
+}
 
 interface Props {
   /** The step the panel currently edits, or null. */
   step: RawStep | null
   /** Index of the step inside `steps[]` — used by the parent to scope patches. */
   index: number
+  /** Workspace-scoped agent list rendered as a dropdown. */
+  availableAgents?: AgentOption[]
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  availableAgents: () => [],
+})
 const emit = defineEmits<{
   (e: 'patch', payload: { index: number; patch: Partial<RawStep> }): void
   (e: 'delete', payload: { index: number }): void
@@ -320,6 +362,23 @@ function onDelete() {
 }
 function onDuplicate() {
   emit('duplicate', { index: props.index })
+}
+
+// Agent picker support — toggles between dropdown and free-text input.
+const useFreeAgentName = ref(false)
+const agentNotInList = computed(() => {
+  const n = props.step?.agentName
+  if (!n) return false
+  return !props.availableAgents.some((a) => a.name === n)
+})
+const agentSelectValue = computed(() => props.step?.agentName ?? '')
+function onAgentSelect(e: Event) {
+  const v = (e.target as HTMLSelectElement).value
+  if (v === '__custom__') {
+    useFreeAgentName.value = true
+    return
+  }
+  patch({ agentName: v })
 }
 </script>
 
@@ -436,6 +495,26 @@ function onDuplicate() {
 .mc-input.mono {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
+}
+.agent-picker {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.agent-picker .mc-input { flex: 1; min-width: 0; }
+.agent-toggle {
+  width: 24px;
+  height: 28px;
+  border: 1px solid var(--mc-border, rgba(0, 0, 0, 0.12));
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mc-text-tertiary, #888);
+  cursor: pointer;
+  font-size: 14px;
+}
+.agent-toggle:hover {
+  background: var(--mc-bg-muted, rgba(0, 0, 0, 0.04));
+  color: var(--mc-text-primary, inherit);
 }
 .panel-hint {
   font-size: 11.5px;

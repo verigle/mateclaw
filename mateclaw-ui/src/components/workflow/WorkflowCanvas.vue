@@ -2,6 +2,21 @@
   <div class="workflow-canvas" :class="{ fullscreen }" :data-canvas-id="canvasId">
     <div class="canvas-toolbar">
       <div class="canvas-toolbar-group">
+        <!-- Add-node picker — inserts a fresh step after the currently
+             selected node (or at the end when nothing is selected). -->
+        <label class="canvas-add-picker">
+          <span class="visually-hidden">{{ t('workflows.canvas.addNode') }}</span>
+          <select :value="''" class="canvas-add-select" @change="onAddNode">
+            <option value="" disabled>{{ t('workflows.canvas.addNode') }}</option>
+            <option value="sequential">+ sequential</option>
+            <option value="fan_out">+ fan_out</option>
+            <option value="collect">+ collect</option>
+            <option value="conditional">+ conditional</option>
+            <option value="await_approval">+ await_approval</option>
+            <option value="dispatch_channel">+ dispatch_channel</option>
+            <option value="write_memory">+ write_memory</option>
+          </select>
+        </label>
         <button class="canvas-btn" :class="{ active: direction === 'LR' }" @click="direction = 'LR'">
           {{ t('workflows.canvas.layoutLR') }}
         </button>
@@ -107,7 +122,22 @@ const props = withDefaults(defineProps<Props>(), { canvasId: 'workflow-canvas' }
 
 const emit = defineEmits<{
   (e: 'select-step', payload: StepNodeData | null): void
+  (e: 'insert-step', payload: { afterIndex: number; modeType: string }): void
 }>()
+
+function onAddNode(e: Event) {
+  const target = e.target as HTMLSelectElement
+  const modeType = target.value
+  if (!modeType) return
+  // Reset the select so a re-pick of the same option re-fires the
+  // change event. Without this the second click of "+ sequential"
+  // would silently no-op.
+  target.value = ''
+  // The parent reads the current selection from canvasSelection, so
+  // we just need to forward the requested mode + a hint about where
+  // (-1 means "append at end" when nothing is selected).
+  emit('insert-step', { afterIndex: -1, modeType })
+}
 
 const { t } = useI18n()
 
@@ -245,6 +275,35 @@ onBeforeUnmount(() => {
   width: 28px;
   padding: 0;
   height: 26px;
+}
+.canvas-add-picker {
+  display: inline-flex;
+  align-items: center;
+}
+.canvas-add-select {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--mc-primary, #4084ff);
+  background: var(--mc-primary-bg, rgba(64, 132, 255, 0.14));
+  color: var(--mc-primary, #4084ff);
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.canvas-add-select:hover {
+  background: var(--mc-primary, #4084ff);
+  color: var(--mc-text-inverse, #ffffff);
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .canvas-toolbar {
   display: flex;
